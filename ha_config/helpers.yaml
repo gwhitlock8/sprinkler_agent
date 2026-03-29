@@ -1,0 +1,83 @@
+# ============================================================
+# Home Assistant — input_number helpers for zone durations
+# ============================================================
+# Add this to your configuration.yaml:
+#   input_number: !include ha_config/helpers.yaml
+#
+# Or paste the contents into your existing input_number section.
+# After saving, restart HA or reload helpers from
+#   Settings → System → Restart → Quick reload
+
+sprinkler_zone_1_duration:
+  name: "Zone 1 Duration (Front Beds)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 8
+  icon: mdi:timer
+
+sprinkler_zone_2_duration:
+  name: "Zone 2 Duration (Front Lawn Right)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 12
+  icon: mdi:timer
+
+sprinkler_zone_3_duration:
+  name: "Zone 3 Duration (Front Lawn Left)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 12
+  icon: mdi:timer
+
+sprinkler_zone_4_duration:
+  name: "Zone 4 Duration (Backyard Left Front)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 10
+  icon: mdi:timer
+
+sprinkler_zone_5_duration:
+  name: "Zone 5 Duration (Backyard Far Left Front)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 10
+  icon: mdi:timer
+
+sprinkler_zone_6_duration:
+  name: "Zone 6 Duration (Backyard Far Left Back)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 10
+  icon: mdi:timer
+
+sprinkler_zone_7_duration:
+  name: "Zone 7 Duration (Backyard Left Flowerbeds)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 8
+  icon: mdi:timer
+
+sprinkler_zone_8_duration:
+  name: "Zone 8 Duration (Backyard Left Back Fence)"
+  min: 1
+  max: 30
+  step: 1
+  unit_of_measurement: "min"
+  initial: 10
+  icon: mdi:timer
+
+# Zone 9 excluded — planned for elimination

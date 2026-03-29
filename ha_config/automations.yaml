@@ -1,0 +1,164 @@
+# ============================================================
+# Home Assistant — Safety Automations for Sprinkler System
+# ============================================================
+# These run inside HA as a second safety layer, independent of
+# the Python agent. Even if the agent crashes, HA protects you.
+#
+# Add to automations.yaml or import via the Automations UI.
+# (Settings → Automations → Import / paste YAML)
+#
+# IMPORTANT: Replace entity IDs if yours differ from the expected pattern.
+# Verify in: Settings → Devices & Services → Entities
+
+# ---------------------------------------------------------------
+# SAFETY 1: Hard timeout — no zone runs more than 30 minutes
+# ---------------------------------------------------------------
+# Triggers when any zone switch has been ON for 30 minutes.
+# Turns it off automatically regardless of what the agent did.
+
+- alias: "Sprinkler Safety - Zone 1 Timeout (30 min)"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_1
+      to: "on"
+      for:
+        minutes: 30
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_1
+    - service: notify.notify   # Optional: sends a notification to your phone
+      data:
+        title: "Sprinkler Safety"
+        message: "Zone 1 auto-shutoff after 30 min timeout."
+  mode: single
+
+- alias: "Sprinkler Safety - Zone 2 Timeout (30 min)"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_2
+      to: "on"
+      for:
+        minutes: 30
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_2
+    - service: notify.notify
+      data:
+        title: "Sprinkler Safety"
+        message: "Zone 2 auto-shutoff after 30 min timeout."
+  mode: single
+
+- alias: "Sprinkler Safety - Zone 3 Timeout (30 min)"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_3
+      to: "on"
+      for:
+        minutes: 30
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_3
+    - service: notify.notify
+      data:
+        title: "Sprinkler Safety"
+        message: "Zone 3 auto-shutoff after 30 min timeout."
+  mode: single
+
+# ---------------------------------------------------------------
+# SAFETY 2: Only one zone at a time
+# ---------------------------------------------------------------
+# If Zone 2 or Zone 3 turns ON while Zone 1 is already ON,
+# immediately shut off the newcomer (Zone 1 wins as an example).
+# The agent's Python logic enforces this first; this is the backup.
+
+- alias: "Sprinkler Safety - Turn off Zone 2 if Zone 1 already on"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_2
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: switch.sprinkler_zone_1
+      state: "on"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_2
+    - service: notify.notify
+      data:
+        message: "Blocked Zone 2: Zone 1 was already running."
+  mode: single
+
+- alias: "Sprinkler Safety - Turn off Zone 3 if Zone 1 already on"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_3
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: switch.sprinkler_zone_1
+      state: "on"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_3
+    - service: notify.notify
+      data:
+        message: "Blocked Zone 3: Zone 1 was already running."
+  mode: single
+
+- alias: "Sprinkler Safety - Turn off Zone 3 if Zone 2 already on"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_3
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: switch.sprinkler_zone_2
+      state: "on"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_3
+    - service: notify.notify
+      data:
+        message: "Blocked Zone 3: Zone 2 was already running."
+  mode: single
+
+- alias: "Sprinkler Safety - Turn off Zone 1 if Zone 2 already on"
+  trigger:
+    - platform: state
+      entity_id: switch.sprinkler_zone_1
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: switch.sprinkler_zone_2
+      state: "on"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.sprinkler_zone_1
+    - service: notify.notify
+      data:
+        message: "Blocked Zone 1: Zone 2 was already running."
+  mode: single
+
+# ---------------------------------------------------------------
+# OPTIONAL: All-off at midnight (failsafe for forgotten zones)
+# ---------------------------------------------------------------
+
+- alias: "Sprinkler Safety - All zones off at midnight"
+  trigger:
+    - platform: time
+      at: "00:00:00"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id:
+          - switch.sprinkler_zone_1
+          - switch.sprinkler_zone_2
+          - switch.sprinkler_zone_3
+  mode: single
