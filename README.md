@@ -43,6 +43,9 @@ Built with LangChain, LangGraph, Claude Haiku, Home Assistant, and the Meta What
 - **Watering history** — logs every zone run to a local JSON file; answers questions like "when did zone 2 last run?" or "how much did I water this week?"
 - **Safety enforced at two layers** — the Python agent checks for zone conflicts before activating anything; Home Assistant automations provide a hardware-level failsafe independent of the agent process
 - **12-zone awareness** — knows which zones are wired and active, which are not yet connected, and which are planned for removal
+- **Dynamic schedule management** — create, list, and delete named watering schedules via WhatsApp; custom schedules persist to disk across restarts
+- **Knowledge-based schedule creation** — ask for an "optimal schedule for Zoysia in Central Texas summer" and the agent applies its built-in horticultural and climate knowledge to generate appropriate durations and frequencies
+- **Weather-aware schedule evaluation** — prompt the agent to evaluate your schedules against current conditions; it proposes specific changes and waits for your approval before saving anything
 - **Conversational memory** — remembers context across messages in the same WhatsApp session (per phone number)
 - **Duplicate message protection** — tracks processed message IDs so Meta's retry behavior doesn't trigger duplicate zone runs
 - **WhatsApp interface** — plain text messages; no app to install
@@ -159,11 +162,15 @@ Tools in this project (`tools.py`):
 | `run_zone` | async | Turn on a zone for N minutes, then turn it off; logs the event |
 | `stop_zone` | async | Immediately turn off a specific zone |
 | `stop_all_zones` | async | Emergency stop — turns off all wired zones |
-| `run_schedule` | async | Run a named preset sequence (e.g. "morning_new_sod"); logs each zone |
+| `run_schedule` | async | Run a named schedule (built-in or custom); logs each zone |
 | `check_weather` | async | Fetch Open-Meteo forecast and return a watering recommendation |
 | `get_zone_info` | sync | Return static info about a zone from config.py |
 | `get_watering_history` | sync | Read watering_log.json and summarize recent events |
 | `get_last_zone_run` | sync | Find the most recent run for a specific zone |
+| `evaluate_schedules` | async | Bundle current weather + season + all schedule details into one context payload for the agent to reason about proposed adjustments |
+| `create_schedule` | sync | Create or overwrite a named schedule and save it to custom_schedules.json |
+| `list_schedules` | sync | List all schedules — both built-in presets and user-created custom ones |
+| `delete_schedule` | sync | Delete a custom schedule (built-in schedules are protected) |
 
 Each tool is decorated with LangChain's `@tool` decorator, which:
 1. Wraps the function in a `StructuredTool` that LangChain can serialize into a JSON schema
@@ -317,30 +324,83 @@ Two tools query the log:
 
 Timestamps are stored in UTC and converted to Austin local time (CDT) for display, so responses like "Zone 2 last ran Thursday Mar 28 at 7:00 AM CDT" are human-readable without timezone confusion.
 
+### Smart Schedule Management
+
+The agent can create, save, and adjust watering schedules dynamically through WhatsApp — no code editing required.
+
+**Dynamic schedule creation:**
+Custom schedules are saved to `custom_schedules.json` by the `create_schedule` tool and persist across server restarts. Built-in presets (defined in `config.py`) remain unchanged and are protected from deletion. Both sources are merged at runtime by `schedules.py` — `run_schedule` works the same way for both.
+
+**Knowledge-based schedule generation:**
+When you ask for an "optimal" or "recommended" schedule, the agent applies built-in knowledge about plant types, Central Texas climate, and seasonal watering norms to generate appropriate durations and frequencies. For example:
+
+- *"Create an optimal watering schedule for Zoysia in Central Texas summer"* — the agent reasons about heat, evaporation rates, and Zoysia's establishment needs, then proposes and saves a schedule.
+- *"Make a quick morning top-up for the sod"* — the agent proposes short cycles appropriate for new sod and saves them.
+
+This knowledge is embedded in the system prompt in `agent.py` and covers:
+- Zoysia Palisades establishment phase (first 4–6 weeks) vs. mature maintenance
+- Central Texas seasonal watering (summer heat, spring/fall adjustments, winter minimums)
+- Tree and shrub watering principles for the specific species in Zone 1
+- Morning vs. midday vs. evening watering tradeoffs (evaporation, fungal risk)
+
+**Weather-based evaluation (prompt-triggered only):**
+The agent never adjusts schedules automatically. When prompted — "it's been 105F all week, should I change my schedules?" — the workflow is:
+
+1. Agent calls `evaluate_schedules`, which returns current weather, the season, and all schedule details with zone plant types in a single payload
+2. Agent reasons about what should change and why, using the weather data and its plant knowledge
+3. Agent proposes specific changes in plain language: *"I'd increase Zone 2 from 8 to 12 min in the midday cycle given the heat forecast — want me to update it?"*
+4. You confirm ("yes", "do it", "sounds good")
+5. Agent calls `create_schedule` to save the updated version
+
+Step 5 never happens without step 4. The agent is instructed to always wait for explicit approval before writing any schedule change.
+
+Example WhatsApp conversations:
+
+```
+You: Create a schedule called evening_sod that runs zone 2 for 8 min and zone 3 for 8 min
+Agent: Schedule 'evening_sod' saved. Zones: Zone 2 (8 min), Zone 3 (8 min). Run it anytime by saying 'run schedule evening_sod'.
+
+You: What schedules do I have?
+Agent: Built-in: morning_new_sod, midday_new_sod, full_front. Custom: evening_sod.
+
+You: It's been over 100F all week. Should I adjust my schedules?
+Agent: Based on the current heat (103F, no rain forecast), I'd suggest increasing your midday cycle: Zone 2 from 8 to 12 min, Zone 3 from 8 to 12 min. New sod loses moisture fast above 95F. Want me to update midday_new_sod?
+
+You: Yes do it
+Agent: midday_new_sod updated. Zone 2 and Zone 3 are now 12 min each.
+
+You: Delete the evening_sod schedule
+Agent: Schedule 'evening_sod' has been deleted.
+```
+
 ---
 
 ## Project Structure
 
 ```
 sprinkler_agent/
-├── main.py              # FastAPI app entry point + test /chat endpoint
-├── agent.py             # LangGraph graph definition + per-user conversation memory
-├── tools.py             # LangChain tools (all agent capabilities)
-├── ha_client.py         # Async Home Assistant REST API client
-├── whatsapp_handler.py  # FastAPI router — Meta webhook + background task processing
-├── weather.py           # Open-Meteo weather fetching (no API key required)
-├── history.py           # Watering event log — read/write watering_log.json
-├── config.py            # Zone definitions, schedules, safety settings
-├── watering_log.json    # Auto-created on first zone run
+├── main.py                  # FastAPI app entry point + test /chat endpoint
+├── agent.py                 # LangGraph graph definition + per-user conversation memory
+├── tools.py                 # LangChain tools (all agent capabilities)
+├── ha_client.py             # Async Home Assistant REST API client
+├── whatsapp_handler.py      # FastAPI router — Meta webhook + background task processing
+├── weather.py               # Open-Meteo weather fetching (no API key required)
+├── history.py               # Watering event log — read/write watering_log.json
+├── schedules.py             # Custom schedule persistence — read/write custom_schedules.json
+├── config.py                # Zone definitions, built-in schedules, safety settings
+├── watering_log.json        # Auto-created on first zone run
+├── custom_schedules.json    # Auto-created when first custom schedule is saved
 ├── requirements.txt
-├── .env.example         # Template for secrets
+├── .env.example             # Template for secrets
 └── ha_config/
-    ├── automations.yaml # HA safety automations (30-min timeout, one-zone-at-a-time)
-    ├── helpers.yaml     # input_number helpers for zone durations
-    └── SETUP.md         # Quick HA setup reference
+    ├── automations.yaml     # HA safety automations (30-min timeout, one-zone-at-a-time)
+    ├── helpers.yaml         # input_number helpers for zone durations
+    └── SETUP.md             # Quick HA setup reference
 ```
 
 **`config.py` is the single source of truth** for the physical system — zone names, HA entity IDs, which ZEN16 relay each zone maps to, whether it's wired, plant type, and default duration. Adding a new zone or updating wiring only requires changes here; no other files need to be touched.
+
+**`schedules.py`** manages user-created schedules separately from the built-in presets in `config.py`. Custom schedules are written to `custom_schedules.json` and persist across server restarts. The `get_all_schedules()` function merges both sources, with custom schedules taking precedence if a name collides with a built-in. Built-in schedule names (`morning_new_sod`, `midday_new_sod`, `full_front`) are protected — the `delete_schedule` tool refuses to remove them.
 
 **`ha_client.py`** is a thin async wrapper around the HA REST API using `httpx`. All zone control goes through this — `turn_on`, `turn_off`, `is_on`, and `get_state`. Making it a separate module keeps `tools.py` clean and makes the HA connection easy to test independently.
 
@@ -643,6 +703,21 @@ curl -X POST http://localhost:8000/chat \
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Show me everything I watered this week"}'
+
+# Create a custom schedule
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Create a schedule called evening_sod that runs zone 2 for 8 minutes and zone 3 for 8 minutes"}'
+
+# Ask for an optimized schedule using plant/climate knowledge
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Create an optimal watering schedule for Zoysia sod in Central Texas summer"}'
+
+# Evaluate schedules against current weather
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "It has been very hot this week. Should I adjust my watering schedules?"}'
 ```
 
 You can also open `http://localhost:8000/docs` for the interactive FastAPI Swagger UI, which lets you test all endpoints in a browser.
@@ -655,7 +730,11 @@ You can also open `http://localhost:8000/docs` for the interactive FastAPI Swagg
 In `config.py`, find the zone's entry and change `"wired": True`. Set the correct `entity_id` matching what HA shows. No other changes needed — the agent reads `config.py` at startup and includes all wired zones automatically.
 
 **Add a new watering schedule:**
-In `config.py`, add an entry to the `SCHEDULES` dict with a name, description, and list of zone/minute pairs. The `run_schedule` tool reads available schedules at runtime and passes them to the LLM via its docstring.
+Two options:
+- Via WhatsApp: "Create a schedule called [name] that runs zone X for Y minutes and zone Z for W minutes" — the agent saves it to `custom_schedules.json` immediately.
+- Via code: add an entry to the `SCHEDULES` dict in `config.py` for a permanent built-in preset. Built-in schedules cannot be deleted through WhatsApp.
+
+Both sources are merged at runtime — `run_schedule` works identically for either.
 
 **Add a new tool:**
 1. Write an async (or sync) function in `tools.py` decorated with `@tool`

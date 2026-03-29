@@ -12,8 +12,9 @@ from langchain_core.tools import tool
 
 from ha_client import ha
 from weather import get_weather_forecast
-from config import ZONES, SCHEDULES, SAFETY
+from config import ZONES, SAFETY
 from history import append_event, get_recent_events, get_last_run_for_zone, format_local_time
+from schedules import get_all_schedules, save_schedule, remove_schedule, BUILTIN_NAMES
 
 
 def _zone_info(zone_num: int) -> str:
@@ -194,9 +195,10 @@ async def run_schedule(schedule_name: str) -> str:
 
     Zones run sequentially with a brief pause between each.
     """
-    sched = SCHEDULES.get(schedule_name)
+    all_schedules = get_all_schedules()
+    sched = all_schedules.get(schedule_name)
     if not sched:
-        available = ", ".join(SCHEDULES.keys())
+        available = ", ".join(all_schedules.keys())
         return f"Schedule '{schedule_name}' not found. Available: {available}"
 
     # Safety: nothing should be on before we start
@@ -364,6 +366,188 @@ def get_last_zone_run(zone_number: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# TOOL: Evaluate schedules against weather
+# ---------------------------------------------------------------------------
+
+@tool
+async def evaluate_schedules() -> str:
+    """
+    Pull together everything needed to evaluate whether current watering schedules
+    should be adjusted: current weather conditions, forecasted rain, temperature,
+    and the full details of all active schedules with zone plant types.
+
+    Use this when the user asks:
+    - "Should I adjust my schedules given recent weather?"
+    - "It's been hot — should I water more?"
+    - "Evaluate my watering schedules"
+    - "Are my schedules right for this time of year?"
+
+    After calling this tool, reason about what changes (if any) are appropriate
+    based on the weather data, plant types, season, and Central Texas climate knowledge.
+    Then PROPOSE the changes to the user in plain language and wait for their approval
+    before saving anything with create_schedule.
+    """
+    from datetime import date
+
+    # --- Weather ---
+    try:
+        w = await get_weather_forecast()
+        weather_section = (
+            f"Current weather in Austin TX:\n"
+            f"  Condition: {w['current_condition']}\n"
+            f"  Temperature: {w['current_temp_f']}F\n"
+            f"  Rain last hour: {w['rain_last_hour_mm']} mm\n"
+            f"  Rain forecast next 24h: {w['rain_next_24h_mm']} mm\n"
+            f"  Watering recommendation: {w['recommendation']}"
+        )
+    except Exception as e:
+        weather_section = f"Weather unavailable: {e}"
+
+    # --- Current date / season context ---
+    month = date.today().month
+    if month in (12, 1, 2):
+        season = "Winter"
+    elif month in (3, 4, 5):
+        season = "Spring"
+    elif month in (6, 7, 8, 9):
+        season = "Summer (extreme heat season)"
+    else:
+        season = "Fall"
+    season_section = f"Current season: {season} (month {month})"
+
+    # --- All schedules with zone details ---
+    all_schedules = get_all_schedules()
+    sched_lines = ["Current schedules:"]
+    for sname, sched in all_schedules.items():
+        tag = "(built-in)" if sname in BUILTIN_NAMES else "(custom)"
+        sched_lines.append(f"\n  Schedule: {sname} {tag}")
+        sched_lines.append(f"  Description: {sched.get('description', 'none')}")
+        for step in sched["zones"]:
+            znum = step["zone"]
+            mins = step["minutes"]
+            zone = ZONES.get(znum, {})
+            plant_type = zone.get("plant_type", "unknown")
+            new = " [NEW PLANTING]" if zone.get("new_planting") else ""
+            sched_lines.append(
+                f"    Zone {znum} ({zone.get('name', '?')}) — {mins} min — {plant_type}{new}"
+            )
+
+    schedules_section = "\n".join(sched_lines)
+
+    return "\n\n".join([season_section, weather_section, schedules_section])
+
+
+# ---------------------------------------------------------------------------
+# TOOL: Schedule management
+# ---------------------------------------------------------------------------
+
+@tool
+def create_schedule(name: str, description: str, zones_config: str) -> str:
+    """
+    Create a new named watering schedule and save it permanently.
+    Use when the user asks to 'create a schedule', 'save a schedule', or 'make a new watering plan'.
+
+    Args:
+        name: short identifier for the schedule, no spaces (e.g. 'evening_sod', 'weekend_full').
+              Use lowercase with underscores.
+        description: one sentence describing when/why to use this schedule.
+        zones_config: JSON array of zone/duration pairs. Format:
+                      '[{"zone": 2, "minutes": 8}, {"zone": 3, "minutes": 10}]'
+                      Zones run in the order listed. Only include wired zones (1-3 currently).
+
+    Example user request: "Create a schedule called evening_sod that runs zone 2 for 8 min and zone 3 for 8 min"
+    Example zones_config: '[{"zone": 2, "minutes": 8}, {"zone": 3, "minutes": 8}]'
+    """
+    import json
+
+    # Validate name
+    name = name.strip().replace(" ", "_").lower()
+    if not name:
+        return "Error: schedule name cannot be empty."
+
+    # Parse zones
+    try:
+        zones = json.loads(zones_config)
+    except json.JSONDecodeError:
+        return (
+            "Error: zones_config must be valid JSON. Example: "
+            '[{"zone": 2, "minutes": 8}, {"zone": 3, "minutes": 10}]'
+        )
+
+    if not isinstance(zones, list) or not zones:
+        return "Error: zones_config must be a non-empty JSON array."
+
+    # Validate each zone entry
+    max_mins = SAFETY["max_zone_duration_minutes"]
+    cleaned = []
+    for step in zones:
+        if not isinstance(step, dict) or "zone" not in step or "minutes" not in step:
+            return f"Error: each zone entry must have 'zone' and 'minutes' keys. Got: {step}"
+        znum = int(step["zone"])
+        mins = int(step["minutes"])
+        if znum not in ZONES:
+            return f"Error: Zone {znum} is not configured."
+        if mins <= 0:
+            return f"Error: minutes must be > 0 for zone {znum}."
+        mins = min(mins, max_mins)
+        cleaned.append({"zone": znum, "minutes": mins})
+
+    save_schedule(name, description, cleaned)
+
+    zone_summary = ", ".join(f"Zone {s['zone']} ({s['minutes']} min)" for s in cleaned)
+    return (
+        f"Schedule '{name}' saved.\n"
+        f"  Description: {description}\n"
+        f"  Zones: {zone_summary}\n"
+        f"Run it anytime by saying 'run schedule {name}'."
+    )
+
+
+@tool
+def list_schedules() -> str:
+    """
+    List all available watering schedules — both built-in presets and user-created custom ones.
+    Use when asked 'what schedules do I have?', 'list my schedules', or 'what presets exist?'
+    """
+    all_schedules = get_all_schedules()
+    if not all_schedules:
+        return "No schedules configured."
+
+    lines = ["Available schedules:\n"]
+    for sname, sched in all_schedules.items():
+        tag = "(built-in)" if sname in BUILTIN_NAMES else "(custom)"
+        desc = sched.get("description", "No description.")
+        zone_parts = [f"Zone {s['zone']} {s['minutes']}min" for s in sched["zones"]]
+        lines.append(f"  {sname} {tag}")
+        lines.append(f"    {desc}")
+        lines.append(f"    Zones: {', '.join(zone_parts)}")
+    return "\n".join(lines)
+
+
+@tool
+def delete_schedule(schedule_name: str) -> str:
+    """
+    Delete a custom (user-created) watering schedule permanently.
+    Built-in schedules (morning_new_sod, midday_new_sod, full_front) cannot be deleted.
+    Use when asked to 'delete schedule', 'remove schedule', or 'get rid of [schedule name]'.
+
+    Args:
+        schedule_name: the exact name of the schedule to delete
+    """
+    try:
+        deleted = remove_schedule(schedule_name)
+    except ValueError as e:
+        return f"Cannot delete: {e}"
+
+    if deleted:
+        return f"Schedule '{schedule_name}' has been deleted."
+    else:
+        all_schedules = get_all_schedules()
+        available = ", ".join(all_schedules.keys())
+        return f"Schedule '{schedule_name}' not found. Available: {available}"
+
+
+# ---------------------------------------------------------------------------
 # All tools for the agent
 # ---------------------------------------------------------------------------
 
@@ -378,4 +562,8 @@ ALL_TOOLS = [
     get_zone_info,
     get_watering_history,
     get_last_zone_run,
+    evaluate_schedules,
+    create_schedule,
+    list_schedules,
+    delete_schedule,
 ]
