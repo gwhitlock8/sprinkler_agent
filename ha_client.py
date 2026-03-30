@@ -90,6 +90,26 @@ class HAClient:
         except (TypeError, ValueError):
             return None
 
+    async def update_last_run(self, zone_number: int) -> bool:
+        """Record the current time as the last-run timestamp for a zone."""
+        from datetime import datetime
+        url = f"{self.base_url}/api/services/input_datetime/set_datetime"
+        payload = {
+            "entity_id": f"input_datetime.sprinkler_zone_{zone_number}_last_run",
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers=self._headers, json=payload)
+        return resp.status_code in (200, 201)
+
+    async def update_text_helper(self, helper_id: str, text: str) -> bool:
+        """Set an input_text helper value (truncated to 255 chars)."""
+        url = f"{self.base_url}/api/services/input_text/set_value"
+        payload = {"entity_id": helper_id, "value": text[:255]}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers=self._headers, json=payload)
+        return resp.status_code in (200, 201)
+
 
 # Singleton — imported by tools.py
 ha = HAClient()

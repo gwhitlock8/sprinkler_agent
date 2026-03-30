@@ -25,6 +25,18 @@ def _zone_info(zone_num: int) -> str:
     return f"Zone {zone_num} ({z['name']})"
 
 
+async def _sync_schedules_to_ha():
+    """Push current schedule list to the HA dashboard display helper."""
+    all_scheds = get_all_schedules()
+    parts = []
+    for name, sched in all_scheds.items():
+        tag = "" if name in BUILTIN_NAMES else " \u2605"
+        zones_str = ", ".join(f"Z{s['zone']}:{s['minutes']}m" for s in sched["zones"])
+        parts.append(f"{name}{tag} ({zones_str})")
+    text = " | ".join(parts)
+    await ha.update_text_helper("input_text.sprinkler_schedules_display", text)
+
+
 # ---------------------------------------------------------------------------
 # TOOL: Get zone status
 # ---------------------------------------------------------------------------
@@ -129,6 +141,9 @@ async def run_zone(zone_number: int, minutes: int) -> str:
     # Turn off
     await ha.turn_off(zone["entity_id"])
 
+    # Update HA last-run helper for dashboard display
+    await ha.update_last_run(zone_number)
+
     # Log the event
     append_event({
         "event_type": "zone_run",
@@ -232,6 +247,7 @@ async def run_schedule(schedule_name: str) -> str:
 
         await asyncio.sleep(mins * 60)
         await ha.turn_off(zone["entity_id"])
+        await ha.update_last_run(znum)
         results.append(f"Zone {znum} ({zone['name']}): ran {mins} min ✓")
 
         # Log each zone run within the schedule
@@ -442,7 +458,7 @@ async def evaluate_schedules() -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def create_schedule(name: str, description: str, zones_config: str) -> str:
+async def create_schedule(name: str, description: str, zones_config: str) -> str:
     """
     Create a new named watering schedule and save it permanently.
     Use when the user asks to 'create a schedule', 'save a schedule', or 'make a new watering plan'.
@@ -493,6 +509,7 @@ def create_schedule(name: str, description: str, zones_config: str) -> str:
         cleaned.append({"zone": znum, "minutes": mins})
 
     save_schedule(name, description, cleaned)
+    await _sync_schedules_to_ha()
 
     zone_summary = ", ".join(f"Zone {s['zone']} ({s['minutes']} min)" for s in cleaned)
     return (
@@ -525,7 +542,7 @@ def list_schedules() -> str:
 
 
 @tool
-def delete_schedule(schedule_name: str) -> str:
+async def delete_schedule(schedule_name: str) -> str:
     """
     Delete a custom (user-created) watering schedule permanently.
     Built-in schedules (morning_new_sod, midday_new_sod, full_front) cannot be deleted.
@@ -540,6 +557,7 @@ def delete_schedule(schedule_name: str) -> str:
         return f"Cannot delete: {e}"
 
     if deleted:
+        await _sync_schedules_to_ha()
         return f"Schedule '{schedule_name}' has been deleted."
     else:
         all_schedules = get_all_schedules()
