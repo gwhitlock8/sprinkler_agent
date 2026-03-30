@@ -203,11 +203,7 @@ async def stop_all_zones() -> str:
 async def run_schedule(schedule_name: str) -> str:
     """
     Run a named watering schedule — a sequence of zones, one at a time.
-    Available schedules:
-      - 'morning_new_sod': Morning cycle for new front yard (zones 1-3). Run daily.
-      - 'midday_new_sod': Midday top-up for new sod on hot days (zones 2-3).
-      - 'full_front': Full front yard, all three wired zones.
-
+    All schedules are user-created. Use list_schedules to see what's available.
     Zones run sequentially with a brief pause between each.
     """
     all_schedules = get_all_schedules()

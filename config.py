@@ -160,29 +160,8 @@ ZONES: dict[int, dict] = {
 # Durations are in minutes and override zone defaults when specified.
 
 SCHEDULES: dict[str, dict] = {
-    "morning_new_sod": {
-        "description": "Morning cycle for new front yard sod (zones 1-3). Run daily.",
-        "zones": [
-            {"zone": 1, "minutes": 8},   # Front beds/trees
-            {"zone": 2, "minutes": 12},  # Front lawn right
-            {"zone": 3, "minutes": 12},  # Front lawn left
-        ],
-    },
-    "midday_new_sod": {
-        "description": "Midday re-hydration for new sod (zones 2-3 only). Run on hot days.",
-        "zones": [
-            {"zone": 2, "minutes": 8},
-            {"zone": 3, "minutes": 8},
-        ],
-    },
-    "full_front": {
-        "description": "Full front yard — all three wired zones.",
-        "zones": [
-            {"zone": 1, "minutes": 10},
-            {"zone": 2, "minutes": 15},
-            {"zone": 3, "minutes": 15},
-        ],
-    },
+    # Built-in schedules removed — all schedules are created and managed
+    # dynamically via the agent (stored in custom_schedules.json).
 }
 
 # ---------------------------------------------------------------------------

@@ -12,8 +12,8 @@ from pathlib import Path
 
 SCHEDULES_FILE = Path(__file__).parent / "custom_schedules.json"
 
-# Built-in schedule names — cannot be deleted via the delete tool
-BUILTIN_NAMES = {"morning_new_sod", "midday_new_sod", "full_front"}
+# No built-in schedules — all schedules are user-created and deletable
+BUILTIN_NAMES: set[str] = set()
 
 
 def _load() -> dict:
