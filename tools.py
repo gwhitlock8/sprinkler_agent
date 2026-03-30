@@ -7,32 +7,53 @@ The docstrings are what the LLM reads to decide when to use each tool — keep t
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import date
 from langchain_core.tools import tool
 
 from ha_client import ha
 from weather import get_weather_forecast
-from config import ZONES, SAFETY
-from history import append_event, get_recent_events, get_last_run_for_zone, format_local_time
-from schedules import get_all_schedules, save_schedule, remove_schedule, BUILTIN_NAMES
+from database import (
+    get_zone, get_all_zones, get_wired_zones, update_zone,
+    get_schedule, get_all_schedules_db, save_schedule_db, delete_schedule_db,
+    log_watering_event, get_recent_events, get_last_run_for_zone,
+    get_setting_int, get_setting_float, format_local_time,
+)
 
 
-def _zone_info(zone_num: int) -> str:
-    """Helper: return a short description of a zone for error messages."""
-    z = ZONES.get(zone_num)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _zone_label(zone_num):
+    """Short label for error messages."""
+    z = get_zone(zone_num)
     if not z:
-        return f"Zone {zone_num} (not configured)"
-    return f"Zone {zone_num} ({z['name']})"
+        return "Zone " + str(zone_num) + " (not configured)"
+    return "Zone " + str(zone_num) + " (" + z["name"] + ")"
+
+
+async def _capture_weather():
+    """Fetch current weather for logging alongside watering events. Fails silently."""
+    try:
+        w = await get_weather_forecast()
+        return {
+            "weather_temp_f": w.get("current_temp_f"),
+            "weather_condition": w.get("current_condition"),
+            "weather_rain_mm": w.get("rain_last_hour_mm"),
+        }
+    except Exception:
+        return {"weather_temp_f": None, "weather_condition": None, "weather_rain_mm": None}
 
 
 async def _sync_schedules_to_ha():
     """Push current schedule list to the HA dashboard display helper."""
-    all_scheds = get_all_schedules()
+    all_scheds = get_all_schedules_db()
     parts = []
     for name, sched in all_scheds.items():
-        tag = "" if name in BUILTIN_NAMES else " \u2605"
-        zones_str = ", ".join(f"Z{s['zone']}:{s['minutes']}m" for s in sched["zones"])
-        parts.append(f"{name}{tag} ({zones_str})")
+        zone_parts = []
+        for s in sched["zones"]:
+            zone_parts.append("Z" + str(s["zone"]) + ":" + str(s["minutes"]) + "m")
+        parts.append(name + " (" + ", ".join(zone_parts) + ")")
     text = " | ".join(parts)
     await ha.update_text_helper("input_text.sprinkler_schedules_display", text)
 
@@ -48,18 +69,18 @@ async def get_zone_status(zone_number: int) -> str:
     Use this to answer questions like 'Is zone 2 running?' or 'What's active right now?'
     Pass zone_number as an integer (1-12).
     """
-    zone = ZONES.get(zone_number)
+    zone = get_zone(zone_number)
     if not zone:
-        return f"Zone {zone_number} is not configured."
+        return "Zone " + str(zone_number) + " is not configured."
     if not zone["wired"]:
         return (
-            f"Zone {zone_number} ({zone['name']}) is not yet wired to a ZEN16 relay. "
-            "It cannot be controlled until wired."
+            "Zone " + str(zone_number) + " (" + zone["name"] + ") is not yet wired "
+            "to a ZEN16 relay. It cannot be controlled until wired."
         )
 
     state = await ha.is_on(zone["entity_id"])
     status = "ON (running)" if state else "OFF"
-    return f"Zone {zone_number} ({zone['name']}): {status}"
+    return "Zone " + str(zone_number) + " (" + zone["name"] + "): " + status
 
 
 @tool
@@ -69,13 +90,14 @@ async def get_all_zones_status() -> str:
     Use this when the user asks 'What's running?' or 'Show me all zones'.
     """
     lines = []
-    for zone_num, zone in ZONES.items():
+    for zone in get_all_zones():
+        zn = zone["zone_number"]
         if not zone["wired"]:
-            lines.append(f"  Zone {zone_num:2d} ({zone['name']}): NOT WIRED")
+            lines.append("  Zone " + str(zn) + " (" + zone["name"] + "): NOT WIRED")
             continue
         state = await ha.is_on(zone["entity_id"])
-        status = "ON  ✓" if state else "off"
-        lines.append(f"  Zone {zone_num:2d} ({zone['name']}): {status}")
+        status = "ON" if state else "off"
+        lines.append("  Zone " + str(zn) + " (" + zone["name"] + "): " + status)
     return "Zone Status:\n" + "\n".join(lines)
 
 
@@ -90,73 +112,67 @@ async def run_zone(zone_number: int, minutes: int) -> str:
     This is the primary tool for watering a single zone.
 
     SAFETY: Will refuse if another zone is already running.
-    Will cap duration at 30 minutes maximum.
+    Will cap duration at the max_zone_duration_minutes setting (default 30).
 
     Args:
         zone_number: integer 1-12
         minutes: how long to run (1-30)
     """
-    zone = ZONES.get(zone_number)
+    zone = get_zone(zone_number)
     if not zone:
-        return f"Error: Zone {zone_number} does not exist."
-
+        return "Error: Zone " + str(zone_number) + " does not exist."
     if not zone["wired"]:
         return (
-            f"Zone {zone_number} ({zone['name']}) is not yet wired. "
+            "Zone " + str(zone_number) + " (" + zone["name"] + ") is not yet wired. "
             "Cannot activate unwired zones."
         )
 
     # Safety cap
-    max_mins = SAFETY["max_zone_duration_minutes"]
+    max_mins = get_setting_int("max_zone_duration_minutes", 30)
+    note = ""
     if minutes > max_mins:
         minutes = max_mins
-        note = f" (capped at {max_mins} min safety limit)"
-    else:
-        note = ""
-
+        note = " (capped at " + str(max_mins) + " min safety limit)"
     if minutes <= 0:
-        return f"Zone {zone_number} has 0 minutes configured — skipped."
+        return "Zone " + str(zone_number) + " has 0 minutes configured — skipped."
 
-    # Safety check: is any other zone already on?
+    # Safety check: is any other wired zone already on?
     active = []
-    for znum, z in ZONES.items():
-        if z["wired"] and znum != zone_number:
+    for z in get_wired_zones():
+        if z["zone_number"] != zone_number:
             if await ha.is_on(z["entity_id"]):
-                active.append(f"Zone {znum} ({z['name']})")
-
+                active.append("Zone " + str(z["zone_number"]) + " (" + z["name"] + ")")
     if active:
         return (
-            f"Safety block: Cannot start Zone {zone_number} because {', '.join(active)} "
-            "is already running. Turn it off first or use stop_all_zones."
+            "Safety block: Cannot start Zone " + str(zone_number) + " because "
+            + ", ".join(active) + " is already running. Turn it off first or use stop_all_zones."
         )
 
     # Turn on
     success = await ha.turn_on(zone["entity_id"])
     if not success:
-        return f"Error: Failed to turn on Zone {zone_number}. Check HA connectivity."
+        return "Error: Failed to turn on Zone " + str(zone_number) + ". Check HA connectivity."
 
-    # Wait for duration (blocking inside async — fine for short durations)
     await asyncio.sleep(minutes * 60)
 
     # Turn off
     await ha.turn_off(zone["entity_id"])
-
-    # Update HA last-run helper for dashboard display
     await ha.update_last_run(zone_number)
 
-    # Log the event
-    append_event({
-        "event_type": "zone_run",
-        "zone": zone_number,
-        "zone_name": zone["name"],
-        "duration_minutes": minutes,
-        "schedule_name": None,
-        "notes": note.strip() if note else None,
-    })
+    # Capture weather and log
+    wx = await _capture_weather()
+    log_watering_event(
+        event_type="zone_run",
+        zone_number=zone_number,
+        zone_name=zone["name"],
+        duration_minutes=minutes,
+        notes=note.strip() if note else None,
+        **wx,
+    )
 
     return (
-        f"Zone {zone_number} ({zone['name']}) ran for {minutes} minute(s){note} and "
-        "has been turned off."
+        "Zone " + str(zone_number) + " (" + zone["name"] + ") ran for "
+        + str(minutes) + " minute(s)" + note + " and has been turned off."
     )
 
 
@@ -170,14 +186,14 @@ async def stop_zone(zone_number: int) -> str:
     Immediately turn off a specific sprinkler zone.
     Use when asked to 'stop zone 2' or 'turn off zone 1'.
     """
-    zone = ZONES.get(zone_number)
+    zone = get_zone(zone_number)
     if not zone:
-        return f"Error: Zone {zone_number} does not exist."
+        return "Error: Zone " + str(zone_number) + " does not exist."
     if not zone["wired"]:
-        return f"Zone {zone_number} is not wired — nothing to stop."
+        return "Zone " + str(zone_number) + " is not wired — nothing to stop."
 
     await ha.turn_off(zone["entity_id"])
-    return f"Zone {zone_number} ({zone['name']}) has been turned off."
+    return "Zone " + str(zone_number) + " (" + zone["name"] + ") has been turned off."
 
 
 @tool
@@ -187,12 +203,10 @@ async def stop_all_zones() -> str:
     Use when the user says 'stop everything', 'emergency stop', or 'turn off all zones'.
     """
     turned_off = []
-    for zone_num, zone in ZONES.items():
-        if zone["wired"]:
-            await ha.turn_off(zone["entity_id"])
-            turned_off.append(f"Zone {zone_num}")
-
-    return f"All zones stopped: {', '.join(turned_off)}."
+    for z in get_wired_zones():
+        await ha.turn_off(z["entity_id"])
+        turned_off.append("Zone " + str(z["zone_number"]))
+    return "All zones stopped: " + ", ".join(turned_off) + "."
 
 
 # ---------------------------------------------------------------------------
@@ -203,64 +217,65 @@ async def stop_all_zones() -> str:
 async def run_schedule(schedule_name: str) -> str:
     """
     Run a named watering schedule — a sequence of zones, one at a time.
-    All schedules are user-created. Use list_schedules to see what's available.
+    Use list_schedules to see what's available.
     Zones run sequentially with a brief pause between each.
     """
-    all_schedules = get_all_schedules()
-    sched = all_schedules.get(schedule_name)
+    sched = get_schedule(schedule_name)
     if not sched:
-        available = ", ".join(all_schedules.keys())
-        return f"Schedule '{schedule_name}' not found. Available: {available}"
+        all_s = get_all_schedules_db()
+        available = ", ".join(all_s.keys()) if all_s else "none"
+        return "Schedule '" + schedule_name + "' not found. Available: " + available
 
-    # Safety: nothing should be on before we start
-    for zone_num, zone in ZONES.items():
-        if zone["wired"] and await ha.is_on(zone["entity_id"]):
+    # Safety: nothing should be on
+    for z in get_wired_zones():
+        if await ha.is_on(z["entity_id"]):
             return (
-                f"Safety block: Zone {zone_num} ({zone['name']}) is already running. "
-                "Stop all zones before running a schedule."
+                "Safety block: Zone " + str(z["zone_number"]) + " (" + z["name"]
+                + ") is already running. Stop all zones before running a schedule."
             )
 
+    max_mins = get_setting_int("max_zone_duration_minutes", 30)
+    delay = get_setting_int("inter_zone_delay_seconds", 5)
     results = []
+
     for step in sched["zones"]:
         znum = step["zone"]
         mins = step["minutes"]
-        zone = ZONES.get(znum)
+        zone = get_zone(znum)
 
         if not zone or not zone["wired"]:
-            results.append(f"Zone {znum}: skipped (not wired)")
+            results.append("Zone " + str(znum) + ": skipped (not wired)")
             continue
         if mins <= 0:
-            results.append(f"Zone {znum}: skipped (0 minutes)")
+            results.append("Zone " + str(znum) + ": skipped (0 minutes)")
             continue
 
-        # Cap duration
-        mins = min(mins, SAFETY["max_zone_duration_minutes"])
+        mins = min(mins, max_mins)
 
         success = await ha.turn_on(zone["entity_id"])
         if not success:
-            results.append(f"Zone {znum} ({zone['name']}): FAILED to turn on")
+            results.append("Zone " + str(znum) + " (" + zone["name"] + "): FAILED to turn on")
             continue
 
         await asyncio.sleep(mins * 60)
         await ha.turn_off(zone["entity_id"])
         await ha.update_last_run(znum)
-        results.append(f"Zone {znum} ({zone['name']}): ran {mins} min ✓")
+        results.append("Zone " + str(znum) + " (" + zone["name"] + "): ran " + str(mins) + " min")
 
-        # Log each zone run within the schedule
-        append_event({
-            "event_type": "zone_run",
-            "zone": znum,
-            "zone_name": zone["name"],
-            "duration_minutes": mins,
-            "schedule_name": schedule_name,
-            "notes": None,
-        })
+        wx = await _capture_weather()
+        log_watering_event(
+            event_type="zone_run",
+            zone_number=znum,
+            zone_name=zone["name"],
+            duration_minutes=mins,
+            schedule_name=schedule_name,
+            **wx,
+        )
 
-        # Brief pause between zones
-        await asyncio.sleep(SAFETY["inter_zone_delay_seconds"])
+        await asyncio.sleep(delay)
 
-    summary = "\n".join(f"  {r}" for r in results)
-    return f"Schedule '{schedule_name}' complete:\n{summary}"
+    summary = "\n".join("  " + r for r in results)
+    return "Schedule '" + schedule_name + "' complete:\n" + summary
 
 
 # ---------------------------------------------------------------------------
@@ -277,15 +292,15 @@ async def check_weather() -> str:
     try:
         w = await get_weather_forecast()
         return (
-            f"Weather Report:\n"
-            f"  Condition: {w['current_condition']}\n"
-            f"  Temperature: {w['current_temp_f']}°F\n"
-            f"  Rain last hour: {w['rain_last_hour_mm']} mm\n"
-            f"  Rain forecast (next 24h): {w['rain_next_24h_mm']} mm\n"
-            f"\nRecommendation: {w['recommendation']}"
+            "Weather Report:\n"
+            "  Condition: " + str(w["current_condition"]) + "\n"
+            "  Temperature: " + str(w["current_temp_f"]) + " F\n"
+            "  Rain last hour: " + str(w["rain_last_hour_mm"]) + " mm\n"
+            "  Rain forecast (next 24h): " + str(w["rain_next_24h_mm"]) + " mm\n"
+            "\nRecommendation: " + w["recommendation"]
         )
     except Exception as e:
-        return f"Could not fetch weather: {e}. Proceed with manual judgment."
+        return "Could not fetch weather: " + str(e) + ". Proceed with manual judgment."
 
 
 # ---------------------------------------------------------------------------
@@ -295,25 +310,75 @@ async def check_weather() -> str:
 @tool
 def get_zone_info(zone_number: int) -> str:
     """
-    Get details about a specific zone: what it waters, plant types, wiring status,
-    and default run time. Use when asked 'what is zone 3?' or 'tell me about zone 1'.
+    Get full details about a specific zone: description, plant types, sprinkler type,
+    location, wiring status, default run time, flow rate, and notes.
+    Use when asked 'what is zone 3?' or 'tell me about zone 1'.
     """
-    zone = ZONES.get(zone_number)
+    zone = get_zone(zone_number)
     if not zone:
-        return f"Zone {zone_number} is not configured (valid range: 1-12)."
+        return "Zone " + str(zone_number) + " is not configured (valid range: 1-12)."
 
     wired_str = "Yes — wired and ready" if zone["wired"] else "No — ZEN16 not yet wired"
-    new_str = "Yes (needs frequent watering)" if zone.get("new_planting") else "No"
+    new_str = "Yes (needs frequent watering)" if zone["new_planting"] else "No"
+    flow = (str(zone["flow_rate_gpm"]) + " GPM") if zone["flow_rate_gpm"] else "Not set"
+    notes = zone["notes"] if zone["notes"] else "None"
 
     return (
-        f"Zone {zone_number}: {zone['name']}\n"
-        f"  Description: {zone['description']}\n"
-        f"  HA Entity: {zone['entity_id']}\n"
-        f"  Wired: {wired_str}\n"
-        f"  New planting: {new_str}\n"
-        f"  Default duration: {zone['default_duration_minutes']} min\n"
-        f"  ZEN16 #{zone['zen16']}, Relay {zone['relay']}"
+        "Zone " + str(zone_number) + ": " + zone["name"] + "\n"
+        "  Description: " + (zone["description"] or "None") + "\n"
+        "  Location: " + (zone["location"] or "Unknown") + "\n"
+        "  Plant type: " + (zone["plant_type"] or "Unknown") + "\n"
+        "  Sprinkler type: " + (zone["sprinkler_type"] or "Unknown") + "\n"
+        "  HA Entity: " + zone["entity_id"] + "\n"
+        "  Wired: " + wired_str + "\n"
+        "  New planting: " + new_str + "\n"
+        "  Default duration: " + str(zone["default_duration_minutes"]) + " min\n"
+        "  Flow rate: " + flow + "\n"
+        "  ZEN16 #" + str(zone["zen16_number"]) + ", Relay " + str(zone["relay_number"]) + "\n"
+        "  Notes: " + notes
     )
+
+
+# ---------------------------------------------------------------------------
+# TOOL: Update zone info
+# ---------------------------------------------------------------------------
+
+@tool
+def update_zone_info(zone_number: int, updates_json: str) -> str:
+    """
+    Update metadata for a specific zone. Use when the user says things like:
+    - 'zone 1 is now established, remove the new planting flag'
+    - 'add a note to zone 2 that the sprayer near the walkway needs repair'
+    - 'zone 2 has bubblers, not sprayers'
+    - 'set the flow rate for zone 1 to 3.5 GPM'
+
+    Args:
+        zone_number: integer 1-12
+        updates_json: JSON object with fields to update. Allowed fields:
+            name, description, wired (0 or 1), new_planting (0 or 1),
+            plant_type, sprinkler_type, location, default_duration_minutes,
+            flow_rate_gpm, notes
+
+    Example: '{"new_planting": 0, "notes": "Sod is now established"}'
+    """
+    zone = get_zone(zone_number)
+    if not zone:
+        return "Error: Zone " + str(zone_number) + " does not exist."
+
+    try:
+        updates = json.loads(updates_json)
+    except json.JSONDecodeError:
+        return "Error: updates_json must be valid JSON."
+
+    if not isinstance(updates, dict) or not updates:
+        return "Error: updates_json must be a non-empty JSON object."
+
+    success = update_zone(zone_number, **updates)
+    if success:
+        changed = ", ".join(str(k) + "=" + str(v) for k, v in updates.items())
+        return "Zone " + str(zone_number) + " updated: " + changed
+    else:
+        return "No valid fields to update. Allowed: name, description, plant_type, sprinkler_type, location, default_duration_minutes, wired, new_planting, flow_rate_gpm, notes"
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +388,10 @@ def get_zone_info(zone_number: int) -> str:
 @tool
 def get_watering_history(days: int = 7) -> str:
     """
-    Get a summary of recent watering events from the local log.
+    Get a summary of recent watering events from the log.
     Use when asked 'when did zone 2 last run?', 'what did I water this week?',
     'did I water yesterday?', or any question about past watering activity.
+    Includes weather conditions at the time of each run when available.
 
     Args:
         days: how many days back to look (default 7, max 30)
@@ -334,21 +400,35 @@ def get_watering_history(days: int = 7) -> str:
     events = get_recent_events(days)
 
     if not events:
-        return f"No watering events recorded in the last {days} days."
+        return "No watering events recorded in the last " + str(days) + " days."
 
-    lines = [f"Watering history — last {days} days ({len(events)} events):\n"]
+    lines = ["Watering history — last " + str(days) + " days (" + str(len(events)) + " events):\n"]
     for e in events:
         time_str = format_local_time(e["timestamp_utc"])
         if e["event_type"] == "zone_run":
-            sched = f" (part of '{e['schedule_name']}')" if e.get("schedule_name") else ""
+            sched = ""
+            if e.get("schedule_name"):
+                sched = " (part of '" + e["schedule_name"] + "')"
+            weather = ""
+            if e.get("weather_temp_f") is not None:
+                weather = " [" + str(e["weather_temp_f"]) + "F"
+                if e.get("weather_condition"):
+                    weather += ", " + e["weather_condition"]
+                weather += "]"
             lines.append(
-                f"  {time_str}: Zone {e['zone']} ({e['zone_name']}) — "
-                f"{e['duration_minutes']} min{sched}"
+                "  " + time_str + ": Zone " + str(e["zone_number"]) + " ("
+                + (e["zone_name"] or "?") + ") — "
+                + str(e["duration_minutes"]) + " min" + sched + weather
             )
         elif e["event_type"] == "zone_skipped":
-            lines.append(f"  {time_str}: Zone {e.get('zone', '?')} skipped — {e.get('notes', '')}")
+            lines.append(
+                "  " + time_str + ": Zone " + str(e.get("zone_number", "?"))
+                + " skipped — " + (e.get("notes") or "")
+            )
         elif e["event_type"] == "manual_stop":
-            lines.append(f"  {time_str}: Manual stop — {e.get('notes', '')}")
+            lines.append(
+                "  " + time_str + ": Manual stop — " + (e.get("notes") or "")
+            )
 
     return "\n".join(lines)
 
@@ -363,17 +443,24 @@ def get_last_zone_run(zone_number: int) -> str:
         zone_number: integer 1-12
     """
     event = get_last_run_for_zone(zone_number)
-    zone = ZONES.get(zone_number)
-    zone_name = zone["name"] if zone else f"Zone {zone_number}"
+    zone = get_zone(zone_number)
+    zone_name = zone["name"] if zone else "Zone " + str(zone_number)
 
     if not event:
-        return f"No watering history found for Zone {zone_number} ({zone_name})."
+        return "No watering history found for Zone " + str(zone_number) + " (" + zone_name + ")."
 
     time_str = format_local_time(event["timestamp_utc"])
-    sched = f" (part of '{event['schedule_name']}')" if event.get("schedule_name") else ""
+    sched = ""
+    if event.get("schedule_name"):
+        sched = " (part of '" + event["schedule_name"] + "')"
+    weather = ""
+    if event.get("weather_temp_f") is not None:
+        weather = ". Weather at that time: " + str(event["weather_temp_f"]) + "F"
+        if event.get("weather_condition"):
+            weather += ", " + event["weather_condition"]
     return (
-        f"Zone {zone_number} ({zone_name}) last ran {time_str} "
-        f"for {event['duration_minutes']} minutes{sched}."
+        "Zone " + str(zone_number) + " (" + zone_name + ") last ran " + time_str
+        + " for " + str(event["duration_minutes"]) + " minutes" + sched + weather + "."
     )
 
 
@@ -389,33 +476,31 @@ async def evaluate_schedules() -> str:
     and the full details of all active schedules with zone plant types.
 
     Use this when the user asks:
-    - "Should I adjust my schedules given recent weather?"
-    - "It's been hot — should I water more?"
-    - "Evaluate my watering schedules"
-    - "Are my schedules right for this time of year?"
+    - 'Should I adjust my schedules given recent weather?'
+    - 'It has been hot — should I water more?'
+    - 'Evaluate my watering schedules'
+    - 'Are my schedules right for this time of year?'
 
     After calling this tool, reason about what changes (if any) are appropriate
     based on the weather data, plant types, season, and Central Texas climate knowledge.
     Then PROPOSE the changes to the user in plain language and wait for their approval
     before saving anything with create_schedule.
     """
-    from datetime import date
-
-    # --- Weather ---
+    # Weather
     try:
         w = await get_weather_forecast()
         weather_section = (
-            f"Current weather in Austin TX:\n"
-            f"  Condition: {w['current_condition']}\n"
-            f"  Temperature: {w['current_temp_f']}F\n"
-            f"  Rain last hour: {w['rain_last_hour_mm']} mm\n"
-            f"  Rain forecast next 24h: {w['rain_next_24h_mm']} mm\n"
-            f"  Watering recommendation: {w['recommendation']}"
+            "Current weather in Austin TX:\n"
+            "  Condition: " + str(w["current_condition"]) + "\n"
+            "  Temperature: " + str(w["current_temp_f"]) + "F\n"
+            "  Rain last hour: " + str(w["rain_last_hour_mm"]) + " mm\n"
+            "  Rain forecast next 24h: " + str(w["rain_next_24h_mm"]) + " mm\n"
+            "  Watering recommendation: " + w["recommendation"]
         )
     except Exception as e:
-        weather_section = f"Weather unavailable: {e}"
+        weather_section = "Weather unavailable: " + str(e)
 
-    # --- Current date / season context ---
+    # Season
     month = date.today().month
     if month in (12, 1, 2):
         season = "Winter"
@@ -425,24 +510,33 @@ async def evaluate_schedules() -> str:
         season = "Summer (extreme heat season)"
     else:
         season = "Fall"
-    season_section = f"Current season: {season} (month {month})"
+    season_section = "Current season: " + season + " (month " + str(month) + ")"
 
-    # --- All schedules with zone details ---
-    all_schedules = get_all_schedules()
+    # All schedules with zone details
+    all_schedules = get_all_schedules_db()
     sched_lines = ["Current schedules:"]
     for sname, sched in all_schedules.items():
-        tag = "(built-in)" if sname in BUILTIN_NAMES else "(custom)"
-        sched_lines.append(f"\n  Schedule: {sname} {tag}")
-        sched_lines.append(f"  Description: {sched.get('description', 'none')}")
+        sched_lines.append("\n  Schedule: " + sname)
+        sched_lines.append("  Description: " + (sched.get("description") or "none"))
         for step in sched["zones"]:
             znum = step["zone"]
             mins = step["minutes"]
-            zone = ZONES.get(znum, {})
-            plant_type = zone.get("plant_type", "unknown")
-            new = " [NEW PLANTING]" if zone.get("new_planting") else ""
-            sched_lines.append(
-                f"    Zone {znum} ({zone.get('name', '?')}) — {mins} min — {plant_type}{new}"
-            )
+            zone = get_zone(znum)
+            if zone:
+                plant = zone.get("plant_type") or "unknown"
+                sprinkler = zone.get("sprinkler_type") or "unknown"
+                new = " [NEW PLANTING]" if zone.get("new_planting") else ""
+                sched_lines.append(
+                    "    Zone " + str(znum) + " (" + zone["name"] + ") — "
+                    + str(mins) + " min — " + plant + " / " + sprinkler + new
+                )
+            else:
+                sched_lines.append(
+                    "    Zone " + str(znum) + " — " + str(mins) + " min"
+                )
+
+    if not all_schedules:
+        sched_lines.append("  No schedules configured.")
 
     schedules_section = "\n".join(sched_lines)
 
@@ -465,19 +559,15 @@ async def create_schedule(name: str, description: str, zones_config: str) -> str
         description: one sentence describing when/why to use this schedule.
         zones_config: JSON array of zone/duration pairs. Format:
                       '[{"zone": 2, "minutes": 8}, {"zone": 3, "minutes": 10}]'
-                      Zones run in the order listed. Only include wired zones (1-3 currently).
+                      Zones run in the order listed.
 
     Example user request: "Create a schedule called evening_sod that runs zone 2 for 8 min and zone 3 for 8 min"
     Example zones_config: '[{"zone": 2, "minutes": 8}, {"zone": 3, "minutes": 8}]'
     """
-    import json
-
-    # Validate name
     name = name.strip().replace(" ", "_").lower()
     if not name:
         return "Error: schedule name cannot be empty."
 
-    # Parse zones
     try:
         zones = json.loads(zones_config)
     except json.JSONDecodeError:
@@ -489,76 +579,76 @@ async def create_schedule(name: str, description: str, zones_config: str) -> str
     if not isinstance(zones, list) or not zones:
         return "Error: zones_config must be a non-empty JSON array."
 
-    # Validate each zone entry
-    max_mins = SAFETY["max_zone_duration_minutes"]
+    max_mins = get_setting_int("max_zone_duration_minutes", 30)
     cleaned = []
     for step in zones:
         if not isinstance(step, dict) or "zone" not in step or "minutes" not in step:
-            return f"Error: each zone entry must have 'zone' and 'minutes' keys. Got: {step}"
+            return "Error: each zone entry must have 'zone' and 'minutes' keys."
         znum = int(step["zone"])
         mins = int(step["minutes"])
-        if znum not in ZONES:
-            return f"Error: Zone {znum} is not configured."
+        if not get_zone(znum):
+            return "Error: Zone " + str(znum) + " is not configured."
         if mins <= 0:
-            return f"Error: minutes must be > 0 for zone {znum}."
+            return "Error: minutes must be > 0 for zone " + str(znum) + "."
         mins = min(mins, max_mins)
         cleaned.append({"zone": znum, "minutes": mins})
 
-    save_schedule(name, description, cleaned)
+    save_schedule_db(name, description, cleaned)
     await _sync_schedules_to_ha()
 
-    zone_summary = ", ".join(f"Zone {s['zone']} ({s['minutes']} min)" for s in cleaned)
+    zone_parts = []
+    for s in cleaned:
+        zone_parts.append("Zone " + str(s["zone"]) + " (" + str(s["minutes"]) + " min)")
+    zone_summary = ", ".join(zone_parts)
+
     return (
-        f"Schedule '{name}' saved.\n"
-        f"  Description: {description}\n"
-        f"  Zones: {zone_summary}\n"
-        f"Run it anytime by saying 'run schedule {name}'."
+        "Schedule '" + name + "' saved.\n"
+        "  Description: " + description + "\n"
+        "  Zones: " + zone_summary + "\n"
+        "Run it anytime by saying 'run schedule " + name + "'."
     )
 
 
 @tool
 def list_schedules() -> str:
     """
-    List all available watering schedules — both built-in presets and user-created custom ones.
+    List all available watering schedules.
     Use when asked 'what schedules do I have?', 'list my schedules', or 'what presets exist?'
     """
-    all_schedules = get_all_schedules()
+    all_schedules = get_all_schedules_db()
     if not all_schedules:
-        return "No schedules configured."
+        return "No schedules configured. Ask me to create one."
 
     lines = ["Available schedules:\n"]
     for sname, sched in all_schedules.items():
-        tag = "(built-in)" if sname in BUILTIN_NAMES else "(custom)"
-        desc = sched.get("description", "No description.")
-        zone_parts = [f"Zone {s['zone']} {s['minutes']}min" for s in sched["zones"]]
-        lines.append(f"  {sname} {tag}")
-        lines.append(f"    {desc}")
-        lines.append(f"    Zones: {', '.join(zone_parts)}")
+        desc = sched.get("description") or "No description."
+        zone_parts = []
+        for s in sched["zones"]:
+            zone_parts.append("Zone " + str(s["zone"]) + " " + str(s["minutes"]) + "min")
+        lines.append("  " + sname)
+        lines.append("    " + desc)
+        lines.append("    Zones: " + ", ".join(zone_parts))
     return "\n".join(lines)
 
 
 @tool
 async def delete_schedule(schedule_name: str) -> str:
     """
-    Delete a custom (user-created) watering schedule permanently.
-    Built-in schedules (morning_new_sod, midday_new_sod, full_front) cannot be deleted.
+    Delete a watering schedule permanently.
     Use when asked to 'delete schedule', 'remove schedule', or 'get rid of [schedule name]'.
 
     Args:
         schedule_name: the exact name of the schedule to delete
     """
-    try:
-        deleted = remove_schedule(schedule_name)
-    except ValueError as e:
-        return f"Cannot delete: {e}"
+    deleted = delete_schedule_db(schedule_name)
 
     if deleted:
         await _sync_schedules_to_ha()
-        return f"Schedule '{schedule_name}' has been deleted."
+        return "Schedule '" + schedule_name + "' has been deleted."
     else:
-        all_schedules = get_all_schedules()
-        available = ", ".join(all_schedules.keys())
-        return f"Schedule '{schedule_name}' not found. Available: {available}"
+        all_schedules = get_all_schedules_db()
+        available = ", ".join(all_schedules.keys()) if all_schedules else "none"
+        return "Schedule '" + schedule_name + "' not found. Available: " + available
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +664,7 @@ ALL_TOOLS = [
     run_schedule,
     check_weather,
     get_zone_info,
+    update_zone_info,
     get_watering_history,
     get_last_zone_run,
     evaluate_schedules,

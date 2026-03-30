@@ -5,4 +5,5 @@ __pycache__/
 venv/
 watering_log.json
 custom_schedules.json
+sprinkler.db
 .claude/

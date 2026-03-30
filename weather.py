@@ -73,22 +73,26 @@ async def get_weather_forecast() -> dict:
 
 
 def _build_recommendation(temp_f: float, rain_now_mm: float, rain_24h_mm: float) -> str:
-    from config import WEATHER  # local import to avoid circular
+    from database import get_setting_float  # local import to avoid circular
+
+    skip_rain = get_setting_float("skip_if_rain_mm", 6.0)
+    hot_temp = get_setting_float("increase_if_temp_above_f", 95.0)
+    cool_temp = get_setting_float("reduce_if_temp_below_f", 65.0)
 
     parts = []
 
     if rain_now_mm > 2:
         parts.append("It's currently raining — skip watering.")
-    elif rain_24h_mm >= WEATHER["skip_if_rain_mm"]:
+    elif rain_24h_mm >= skip_rain:
         parts.append(
             f"Rain expected ({rain_24h_mm:.1f}mm in next 24h) — recommend skipping."
         )
     else:
         parts.append("No significant rain expected — watering is appropriate.")
 
-    if temp_f >= WEATHER["increase_if_temp_above_f"]:
+    if temp_f >= hot_temp:
         parts.append(f"It's hot ({temp_f}°F) — consider adding 20% to run times.")
-    elif temp_f <= WEATHER["reduce_if_temp_below_f"]:
+    elif temp_f <= cool_temp:
         parts.append(f"It's cool ({temp_f}°F) — can reduce run times by 30%.")
 
     return " ".join(parts)

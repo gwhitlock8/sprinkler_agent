@@ -19,6 +19,10 @@ load_dotenv()   # Must be before any other imports that use os.getenv
 import uvicorn
 from fastapi import FastAPI
 from whatsapp_handler import router as whatsapp_router
+from database import init_db
+
+# Initialize SQLite database (creates tables + seeds data on first run)
+init_db()
 
 app = FastAPI(title="Sprinkler Agent")
 app.include_router(whatsapp_router)
